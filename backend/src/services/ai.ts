@@ -1,16 +1,19 @@
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { z } from "zod";
 import { env } from "../lib/env";
 import { logger } from "../lib/logger";
+import { extractResponseText, summarizeAiResponse } from "./ai-text";
+
+export { extractResponseText } from "./ai-text";
 
 // ============================================
 // Constants
 // ============================================
 export const AI_CONFIG = {
-  LOCATION: "global",
-  MODEL: "gemini-3.1-flash-lite",
-  MAX_TOKENS: 2048,
-  TEMPERATURE: 0.7,
+    LOCATION: "global",
+    MODEL: "gemini-3.1-flash-lite",
+    MAX_TOKENS: 2048,
+    TEMPERATURE: 0.7,
 } as const;
 
 export const SYSTEM_PROMPT = `
@@ -27,7 +30,7 @@ export const PLAN_SYSTEM_PROMPT = `
 You are a warm, wise, and bible-literate companion named "Selah AI".
 Your goal is to create a personalized daily devotional plan based on the user's intention and emotional state.
 
-CRITICAL: Return ONLY a valid JSON array. No markdown, no backticks, no explanation, no preamble. Just the raw JSON array.
+CRITICAL: Return ONLY valid JSON matching the required schema. No markdown, no backticks, no explanation, no preamble.
 
 Rules:
 - Use the NIV or NLT translation.
@@ -35,16 +38,8 @@ Rules:
 - The encouragement should be pastoral, gentle, and directly tied to the verse.
 - The plan should be sensitive to the user's initial sentiment and gently guide them toward their intention.
 - Encouragement should be concise (under 100 words per day).
-
-Return an array of exactly {duration} objects in this exact shape:
-[
-  {
-    "day_number": 1,
-    "bible_verse": "John 3:16",
-    "verse_content": "For God so loved the world...",
-    "encouragement_from_verse": "..."
-  }
-]
+- day_number must be sequential starting at 1.
+- Return exactly {duration} days in the "days" array.
 `.trim();
 
 // ============================================
@@ -57,8 +52,41 @@ export const PlanDaySchema = z.object({
     encouragement_from_verse: z.string().min(1),
 });
 
+export const PlanDaysResponseSchema = z.object({
+    days: z.array(PlanDaySchema).min(1),
+});
+
 export const PlanSchema = z.array(PlanDaySchema);
 export type PlanDay = z.infer<typeof PlanDaySchema>;
+
+function buildPlanResponseJsonSchema(duration: number) {
+    return {
+        type: "object",
+        properties: {
+            days: {
+                type: "array",
+                minItems: duration,
+                maxItems: duration,
+                items: {
+                    type: "object",
+                    properties: {
+                        day_number: { type: "integer" },
+                        bible_verse: { type: "string" },
+                        verse_content: { type: "string" },
+                        encouragement_from_verse: { type: "string" },
+                    },
+                    required: [
+                        "day_number",
+                        "bible_verse",
+                        "verse_content",
+                        "encouragement_from_verse",
+                    ],
+                },
+            },
+        },
+        required: ["days"],
+    };
+}
 
 // ============================================
 // Custom Errors
@@ -126,17 +154,28 @@ class AIService {
                 config: {
                     maxOutputTokens: AI_CONFIG.MAX_TOKENS,
                     temperature: AI_CONFIG.TEMPERATURE,
+                    // Keep chat snappy; thinking eats the output budget on 3.x
+                    thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
                 },
             });
 
-            const text = response.candidates?.[0]?.content?.parts?.[0]?.text;
+            const text = extractResponseText(response);
 
             if (!text) {
+                logger.error(
+                    "AI chat response contained no usable text",
+                    new Error("Empty AI response"),
+                    {
+                        model: AI_CONFIG.MODEL,
+                        ...summarizeAiResponse(response),
+                    }
+                );
                 throw new Error("No response text from AI model");
             }
 
             logger.info("AI response generated successfully", {
                 responseLength: text.length,
+                finishReason: response.candidates?.[0]?.finishReason,
             });
 
             return text;
@@ -145,14 +184,16 @@ class AIService {
             logger.error("Google AI Studio request failed", error, {
                 model: AI_CONFIG.MODEL,
                 messageLength: userMessage.length,
-                errorCode: error.code,
-                errorMessage: error.message,
+                errorCode: error?.code,
+                errorMessage: error?.message,
+                errorStatus: error?.status,
             });
 
             // Check for quota errors
             if (
                 error.code === 429 ||
                 error.code === "429" ||
+                error.status === 429 ||
                 error.message?.toLowerCase().includes("quota") ||
                 error.message?.toLowerCase().includes("rate limit")
             ) {
@@ -178,12 +219,17 @@ class AIService {
             "{duration}",
             String(duration)
         );
-        const userMessage = `Sentiment: ${sentiment}\nIntention: ${intention}`;
+        const userMessage = `Sentiment: ${sentiment}\nIntention: ${intention}\nDuration: ${duration} days`;
+        // Leave headroom for structured JSON; thinking still consumes budget on 3.x
+        const maxOutputTokens = Math.min(Math.max(duration * 450, 4096), 16384);
 
         try {
-            logger.debug("Generating devotional plan", {
+            logger.info("Generating devotional plan", {
                 duration,
                 model: AI_CONFIG.MODEL,
+                maxOutputTokens,
+                sentimentLength: sentiment.length,
+                intentionLength: intention.length,
             });
 
             const response = await client.models.generateContent({
@@ -198,19 +244,51 @@ class AIService {
                     },
                 ],
                 config: {
-                    maxOutputTokens: Math.min(duration * 300, 8192),
-                    temperature: 0.9,
+                    maxOutputTokens,
+                    temperature: 0.7,
+                    responseMimeType: "application/json",
+                    responseJsonSchema: buildPlanResponseJsonSchema(duration),
+                    // Structured plan generation should not spend the token
+                    // budget on thinking summaries.
+                    thinkingConfig: {
+                        thinkingLevel: ThinkingLevel.MINIMAL,
+                    },
                 },
             });
 
-            const text =
-                response.candidates?.[0]?.content?.parts?.[0]?.text;
+            const summary = summarizeAiResponse(response);
+            const text = extractResponseText(response);
 
             if (!text) {
-                throw new Error("No response text from AI model");
+                logger.error(
+                    "AI plan response contained no usable text",
+                    new Error("Empty AI plan response"),
+                    {
+                        model: AI_CONFIG.MODEL,
+                        duration,
+                        ...summary,
+                    }
+                );
+                throw new AIServiceError("No response text from AI model");
             }
 
-            // Strip markdown code fences if Gemini wraps the JSON
+            if (summary.finishReason === "MAX_TOKENS") {
+                logger.error(
+                    "AI plan response truncated by maxOutputTokens",
+                    new Error("MAX_TOKENS"),
+                    {
+                        model: AI_CONFIG.MODEL,
+                        duration,
+                        maxOutputTokens,
+                        ...summary,
+                    }
+                );
+                throw new AIServiceError(
+                    "AI plan response was truncated — try a shorter duration"
+                );
+            }
+
+            // Strip markdown code fences if the model ignores mime type
             const cleanedText = text
                 .replace(/^```json\s*/i, "")
                 .replace(/^```\s*/i, "")
@@ -220,35 +298,61 @@ class AIService {
             let parsed: unknown;
             try {
                 parsed = JSON.parse(cleanedText);
-            } catch {
+            } catch (parseError) {
                 logger.error(
                     "Failed to parse AI plan response as JSON",
-                    new Error("JSON parse failure"),
-                    { preview: cleanedText.slice(0, 200) }
+                    parseError,
+                    {
+                        model: AI_CONFIG.MODEL,
+                        duration,
+                        ...summary,
+                        preview: cleanedText.slice(0, 500),
+                    }
                 );
-                throw new AIServiceError(
-                    "AI returned invalid plan format"
-                );
+                throw new AIServiceError("AI returned invalid plan format");
             }
 
-            const result = PlanSchema.safeParse(parsed);
+            const result = PlanDaysResponseSchema.safeParse(parsed);
             if (!result.success) {
                 logger.error(
                     "AI plan response failed schema validation",
-                    new Error(String(result.error)),
-                    { preview: cleanedText.slice(0, 200) }
+                    result.error,
+                    {
+                        model: AI_CONFIG.MODEL,
+                        duration,
+                        issues: result.error.issues,
+                        preview: cleanedText.slice(0, 500),
+                    }
+                );
+                throw new AIServiceError("AI returned invalid plan structure");
+            }
+
+            const days = result.data.days;
+            if (days.length !== duration) {
+                logger.error(
+                    "AI plan day count mismatch",
+                    new Error(
+                        `Expected ${duration} days, got ${days.length}`
+                    ),
+                    {
+                        model: AI_CONFIG.MODEL,
+                        duration,
+                        daysGenerated: days.length,
+                    }
                 );
                 throw new AIServiceError(
-                    "AI returned invalid plan structure"
+                    `AI returned ${days.length} days instead of ${duration}`
                 );
             }
 
             logger.info("Devotional plan generated successfully", {
                 duration,
-                daysGenerated: result.data.length,
+                daysGenerated: days.length,
+                finishReason: summary.finishReason,
+                usageMetadata: summary.usageMetadata,
             });
 
-            return result.data;
+            return days;
         } catch (error: any) {
             // Re-throw our own typed errors without wrapping
             if (
@@ -264,14 +368,17 @@ class AIService {
                 {
                     model: AI_CONFIG.MODEL,
                     duration,
-                    errorCode: error.code,
-                    errorMessage: error.message,
+                    errorCode: error?.code,
+                    errorMessage: error?.message,
+                    errorStatus: error?.status,
+                    errorDetails: error?.details,
                 }
             );
 
             if (
                 error.code === 429 ||
                 error.code === "429" ||
+                error.status === 429 ||
                 error.message?.toLowerCase().includes("quota") ||
                 error.message?.toLowerCase().includes("rate limit")
             ) {

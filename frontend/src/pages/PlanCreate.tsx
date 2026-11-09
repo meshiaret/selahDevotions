@@ -39,10 +39,22 @@ const PlanCreate = () => {
 
             if (response?.plan?.id) {
                 navigate(`/plans/${response.plan.id}`, { replace: true });
+            } else {
+                console.error("Plan create returned unexpected payload", response);
+                toast.error("Plan was created but the response was incomplete.");
             }
         } catch (err) {
-            console.error("Failed to create plan:", err);
-            toast.error("Oops, that didn't work.");
+            const message =
+                err instanceof Error && err.message
+                    ? err.message
+                    : "Oops, that didn't work.";
+            console.error("Failed to create plan:", {
+                message,
+                status: (err as { status?: number })?.status,
+                body: (err as { body?: unknown })?.body,
+                err,
+            });
+            toast.error(message);
         } finally {
             setLoading(false);
         }

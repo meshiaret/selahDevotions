@@ -3,7 +3,11 @@ import { z } from "zod";
 import { zValidator } from "@hono/zod-validator";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { logger } from "../lib/logger";
-import { aiService, AIQuotaExceededError } from "../services/ai";
+import {
+    aiService,
+    AIQuotaExceededError,
+    AIServiceError,
+} from "../services/ai";
 import { rateLimitMiddleware } from "../middleware/rate-limit";
 
 // ============================================
@@ -44,11 +48,36 @@ const closingSentimentSchema = z.object({
 plans.post(
     "/",
     planRateLimit,
-    zValidator("json", createPlanSchema),
+    zValidator("json", createPlanSchema, (result, c) => {
+        if (!result.success) {
+            logger.warn("Plan create validation failed", {
+                issues: result.error.issues.map((issue) => ({
+                    path: issue.path.join("."),
+                    code: issue.code,
+                    message: issue.message,
+                })),
+            });
+            return c.json(
+                {
+                    error: "Invalid plan data",
+                    details: result.error.flatten(),
+                },
+                400
+            );
+        }
+    }),
     async (c) => {
         const user = c.get("user");
         const supabase = c.get("supabase");
         const body = c.req.valid("json");
+
+        logger.info("Plan create requested", {
+            userId: user.id,
+            duration: body.duration,
+            titleLength: body.title.length,
+            sentimentLength: body.initial_sentiment.length,
+            intentionLength: body.intention.length,
+        });
 
         try {
             // 1. Generate all daily content via AI
@@ -72,9 +101,14 @@ plans.post(
                 .single();
 
             if (planError || !plan) {
-                logger.error("Failed to insert plan", planError ?? new Error("No data"), {
-                    userId: user.id,
-                });
+                logger.error(
+                    "Failed to insert plan",
+                    planError ?? new Error("No plan row returned"),
+                    {
+                        userId: user.id,
+                        duration: body.duration,
+                    }
+                );
                 return c.json({ error: "Failed to create plan" }, 500);
             }
 
@@ -93,26 +127,44 @@ plans.post(
 
             if (timelinesError) {
                 // Roll back the plan to avoid orphaned records
-                await supabase.from("plans").delete().eq("id", plan.id);
+                const { error: rollbackError } = await supabase
+                    .from("plans")
+                    .delete()
+                    .eq("id", plan.id);
+
                 logger.error(
                     "Failed to insert plan timelines — plan rolled back",
                     timelinesError,
-                    { userId: user.id, planId: plan.id }
+                    {
+                        userId: user.id,
+                        planId: plan.id,
+                        timelineCount: timelineRows.length,
+                        rollbackError: rollbackError ?? null,
+                    }
                 );
                 return c.json({ error: "Failed to create plan timelines" }, 500);
             }
 
             // 4. Fetch timelines ordered by day_number for the response
-            const { data: timelines } = await supabase
+            const { data: timelines, error: fetchError } = await supabase
                 .from("plan_timelines")
                 .select("*")
                 .eq("plan_id", plan.id)
                 .order("day_number", { ascending: true });
 
+            if (fetchError) {
+                logger.warn("Plan created but timeline fetch failed", {
+                    userId: user.id,
+                    planId: plan.id,
+                    fetchError,
+                });
+            }
+
             logger.info("Plan created successfully", {
                 userId: user.id,
                 planId: plan.id,
                 duration: body.duration,
+                timelineCount: timelines?.length ?? timelineRows.length,
             });
 
             return c.json(
@@ -129,6 +181,10 @@ plans.post(
             );
         } catch (error) {
             if (error instanceof AIQuotaExceededError) {
+                logger.warn("Plan create blocked by AI quota", {
+                    userId: user.id,
+                    duration: body.duration,
+                });
                 return c.json(
                     {
                         error: "We have run out of fish and bread. Please return later for more sustenance.",
@@ -137,10 +193,22 @@ plans.post(
                 );
             }
 
-            logger.error("Failed to create plan", error as Error, {
+            logger.error("Failed to create plan", error, {
                 userId: user.id,
+                duration: body.duration,
+                errorName:
+                    error instanceof Error ? error.name : typeof error,
+                errorMessage:
+                    error instanceof Error ? error.message : String(error),
+                isAiServiceError: error instanceof AIServiceError,
             });
-            return c.json({ error: "Failed to create plan" }, 500);
+
+            const clientMessage =
+                error instanceof AIServiceError
+                    ? "Failed to generate plan content. Please try again."
+                    : "Failed to create plan";
+
+            return c.json({ error: clientMessage }, 500);
         }
     }
 );

@@ -6,6 +6,48 @@ interface LogContext {
     [key: string]: any;
 }
 
+/**
+ * Normalize Error / PostgrestError / plain objects into a loggable shape.
+ * Supabase errors are often not `instanceof Error`, so message/code/details
+ * were previously dropped.
+ */
+export function serializeError(error?: unknown): Record<string, unknown> | undefined {
+    if (error === undefined || error === null) return undefined;
+
+    if (error instanceof Error) {
+        const anyErr = error as Error & Record<string, unknown>;
+        return {
+            name: error.name,
+            message: error.message,
+            stack: error.stack,
+            ...(anyErr.code !== undefined ? { code: anyErr.code } : {}),
+            ...(anyErr.details !== undefined ? { details: anyErr.details } : {}),
+            ...(anyErr.hint !== undefined ? { hint: anyErr.hint } : {}),
+            ...(anyErr.status !== undefined ? { status: anyErr.status } : {}),
+            ...(anyErr.cause !== undefined
+                ? { cause: serializeError(anyErr.cause) }
+                : {}),
+        };
+    }
+
+    if (typeof error === "object") {
+        const obj = error as Record<string, unknown>;
+        return {
+            name: typeof obj.name === "string" ? obj.name : "UnknownError",
+            message:
+                typeof obj.message === "string"
+                    ? obj.message
+                    : JSON.stringify(obj),
+            ...(obj.code !== undefined ? { code: obj.code } : {}),
+            ...(obj.details !== undefined ? { details: obj.details } : {}),
+            ...(obj.hint !== undefined ? { hint: obj.hint } : {}),
+            ...(obj.status !== undefined ? { status: obj.status } : {}),
+        };
+    }
+
+    return { message: String(error) };
+}
+
 class Logger {
     private serviceName: string;
     private minLevel: LogLevel;
@@ -62,16 +104,10 @@ class Logger {
         this.log("warn", message, context);
     }
 
-    error(message: string, error?: Error, context?: LogContext) {
+    error(message: string, error?: unknown, context?: LogContext) {
         this.log("error", message, {
             ...context,
-            error: error
-                ? {
-                      name: error.name,
-                      message: error.message,
-                      stack: error.stack,
-                  }
-                : undefined,
+            error: serializeError(error),
         });
     }
 

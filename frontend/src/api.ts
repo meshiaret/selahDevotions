@@ -73,9 +73,22 @@ async function request<T>(
         }
 
         // Handle other errors
-        const error = await response.json().catch(() => ({}));
-        const message = error.error || "Something went wrong";
-        throw new Error(message);
+        const errorBody = await response.json().catch(() => ({}));
+        const message =
+            (typeof errorBody?.error === "string" && errorBody.error) ||
+            "Something went wrong";
+        const err = new Error(message) as Error & {
+            status?: number;
+            body?: unknown;
+        };
+        err.status = response.status;
+        err.body = errorBody;
+        console.error("API request failed", {
+            endpoint,
+            status: response.status,
+            body: errorBody,
+        });
+        throw err;
     }
 
     return response.json();
